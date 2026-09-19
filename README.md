@@ -2,7 +2,7 @@
 
 Two servers, one Redis, two surfaces — built to answer one question:
 
-> Why does a WebSocket app need Redis at all?
+> Why does a WebSocket app need Redis at all? Got it
 
 | Surface | URL | What it teaches |
 |---|---|---|
