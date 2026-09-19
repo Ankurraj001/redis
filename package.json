@@ -1,0 +1,17 @@
+{
+  "name": "websocket-redis-poc",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal POC: WebSockets + Redis Pub/Sub across two server instances",
+  "scripts": {
+    "start:a": "PORT=3001 INSTANCE=server-A node server.js",
+    "start:b": "PORT=3002 INSTANCE=server-B node server.js",
+    "start:a:noredis": "PORT=3001 INSTANCE=server-A REDIS_DISABLED=1 node server.js",
+    "start:b:noredis": "PORT=3002 INSTANCE=server-B REDIS_DISABLED=1 node server.js"
+  },
+  "dependencies": {
+    "ioredis": "^5.4.1",
+    "ws": "^8.18.0"
+  }
+}

@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Collaborative board — WS + Redis POC</title>
+<style>
+  :root { --a: #2563eb; --b: #16a34a; --bg: #0f172a; --panel: #1e293b; --text: #e2e8f0; --muted: #94a3b8; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+         background: var(--bg); color: var(--text); display: flex; justify-content: center; }
+  .app { width: 100%; max-width: 960px; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+  header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .badge { font-weight: 700; padding: 4px 12px; border-radius: 999px; color: #fff; background: #475569; }
+  .badge.server-A { background: var(--a); }
+  .badge.server-B { background: var(--b); }
+  .meta { color: var(--muted); font-size: 13px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #64748b; margin-right: 6px; }
+  .dot.open { background: #22c55e; } .dot.closed { background: #ef4444; } .dot.connecting { background: #eab308; }
+  a { color: #7dd3fc; }
+  #peers { display: flex; gap: 6px; flex-wrap: wrap; }
+  .peer { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--panel); border: 1px solid #334155; }
+  .peer i { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; }
+
+  #board { position: relative; height: 480px; background: var(--panel); border-radius: 10px; overflow: hidden;
+           background-image: radial-gradient(#334155 1px, transparent 1px); background-size: 24px 24px; cursor: crosshair; }
+  .shape { position: absolute; border-radius: 8px; display: flex; align-items: center; justify-content: center;
+           font-weight: 700; color: #fff; cursor: grab; user-select: none;
+           box-shadow: 0 4px 14px rgba(0,0,0,.4); transition: outline-color .15s; outline: 2px solid transparent; }
+  .shape:active { cursor: grabbing; }
+  .shape .tag { position: absolute; bottom: -18px; left: 0; font-size: 11px; font-weight: 500; color: var(--muted); white-space: nowrap; }
+  .shape.rejected { outline-color: #ef4444; }
+  .cursor { position: absolute; pointer-events: none; transition: transform .05s linear; z-index: 10; }
+  .cursor svg { display: block; filter: drop-shadow(0 1px 2px rgba(0,0,0,.6)); }
+  .cursor span { font-size: 11px; padding: 1px 6px; border-radius: 4px; color: #fff; position: relative; top: -4px; left: 10px; }
+
+  footer { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  button { font: inherit; padding: 8px 12px; border-radius: 8px; border: 1px solid #334155;
+           background: #334155; color: var(--text); cursor: pointer; font-weight: 600; }
+  button:hover { background: #475569; }
+  label { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  #rejects { color: #f87171; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <span>Board on</span>
+    <span class="badge" id="instance">…</span>
+    <span class="meta"><span class="dot connecting" id="dot"></span><span id="status">connecting</span></span>
+    <span class="meta">· <a href="/">chat</a></span>
+    <span class="meta" id="peers"></span>
+  </header>
+
+  <div id="board"></div>
+
+  <footer>
+    <button id="reset">Reset board</button>
+    <label><input type="checkbox" id="auto" /> auto-drag box 1 (to fight over)</label>
+    <span class="meta">rejected moves (stale version): <b id="rejects">0</b></span>
+  </footer>
+
+  <p class="meta">
+    Drag the boxes. Open <a href="http://localhost:3001/board">:3001/board</a> and
+    <a href="http://localhost:3002/board">:3002/board</a> side by side — different servers,
+    same board, synced only by Redis. Shapes live in a Redis HASH, so a tab opened later
+    still sees them. Cursors are Pub/Sub only and are never stored.
+  </p>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const boardEl = $('board');
+
+  let me = null;                  // { clientId, name, color, instance }
+  const shapes = new Map();       // id -> shape (server-authoritative + local optimism)
+  const shapeEls = new Map();     // id -> DOM node
+  const cursorEls = new Map();    // clientId -> DOM node
+  const peers = new Map();        // clientId -> peer
+  let drag = null;                // { id, dx, dy } while the mouse is down
+  let rejects = 0;
+  let ws;
+
+  // --- rendering ----------------------------------------------------------
+
+  function renderShape(shape) {
+    let el = shapeEls.get(shape.id);
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'shape';
+      el.innerHTML = '<span class="label"></span><span class="tag"></span>';
+      el.addEventListener('mousedown', (e) => startDrag(e, shape.id));
+      boardEl.appendChild(el);
+      shapeEls.set(shape.id, el);
+    }
+    el.style.left = shape.x + 'px';
+    el.style.top = shape.y + 'px';
+    el.style.width = shape.w + 'px';
+    el.style.height = shape.h + 'px';
+    el.style.background = shape.color;
+    el.querySelector('.label').textContent = shape.label;
+    // v<n> is the version guard the server used to accept this write.
+    el.querySelector('.tag').textContent = 'v' + shape.version + ' · ' + (shape.movedByName || 'seed');
+  }
+
+  function renderPeers() {
+    $('peers').innerHTML = '';
+    for (const p of peers.values()) {
+      const el = document.createElement('span');
+      el.className = 'peer';
+      el.innerHTML = '<i style="background:' + p.color + '"></i>' +
+        escapeHtml(p.name) + (p.clientId === me?.clientId ? ' (you)' : '') +
+        ' <span style="opacity:.6">' + escapeHtml(p.instance) + '</span>';
+      $('peers').appendChild(el);
+    }
+  }
+
+  function renderCursor(m) {
+    if (m.clientId === me?.clientId) return; // don't draw your own pointer twice
+    let el = cursorEls.get(m.clientId);
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'cursor';
+      el.innerHTML =
+        '<svg width="16" height="20" viewBox="0 0 16 20"><path d="M1 1 L1 16 L5 12 L8 19 L11 18 L8 11 L14 11 Z" fill="' +
+        m.color + '" stroke="#0f172a" stroke-width="1.2"/></svg>' +
+        '<span style="background:' + m.color + '">' + escapeHtml(m.name) + '</span>';
+      boardEl.appendChild(el);
+      cursorEls.set(m.clientId, el);
+    }
+    el.style.transform = 'translate(' + m.x + 'px,' + m.y + 'px)';
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  // --- dragging -----------------------------------------------------------
+
+  function startDrag(e, id) {
+    const shape = shapes.get(id);
+    const rect = boardEl.getBoundingClientRect();
+    drag = { id, dx: e.clientX - rect.left - shape.x, dy: e.clientY - rect.top - shape.y };
+    e.preventDefault();
+  }
+
+  // mousemove fires 60-120x/second. Sending every one of those straight to
+  // Redis is how you turn a chat app into a load test, so both the move and
+  // cursor streams are throttled. This is a real thing you have to do.
+  const throttle = (fn, ms) => {
+    let last = 0, pending = null;
+    return (...args) => {
+      const now = Date.now();
+      if (now - last >= ms) { last = now; fn(...args); }
+      else { clearTimeout(pending); pending = setTimeout(() => { last = Date.now(); fn(...args); }, ms - (now - last)); }
+    };
+  };
+
+  function sendMove(id) {
+    const s = shapes.get(id);
+    if (!s || !ws || ws.readyState !== WebSocket.OPEN) return;
+    // baseVersion is what we *think* is current. If the server has moved past
+    // it, our write is rejected - that's the last-write-wins guard.
+    ws.send(JSON.stringify({ type: 'move', ...s, baseVersion: s.version }));
+  }
+  const sendMoveThrottled = throttle(sendMove, 40);
+  const sendCursorThrottled = throttle((x, y) => {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'cursor', x, y }));
+  }, 50);
+
+  boardEl.addEventListener('mousemove', (e) => {
+    const rect = boardEl.getBoundingClientRect();
+    const x = Math.round(e.clientX - rect.left);
+    const y = Math.round(e.clientY - rect.top);
+    sendCursorThrottled(x, y);
+
+    if (!drag) return;
+    const shape = shapes.get(drag.id);
+    // Optimistic local update: move it now, ask the server after. Waiting for
+    // the round trip before painting is what makes collab apps feel laggy.
+    shape.x = Math.max(0, Math.min(x - drag.dx, boardEl.clientWidth - shape.w));
+    shape.y = Math.max(0, Math.min(y - drag.dy, boardEl.clientHeight - shape.h));
+    renderShape(shape);
+    sendMoveThrottled(drag.id);
+  });
+
+  window.addEventListener('mouseup', () => {
+    if (drag) { sendMove(drag.id); drag = null; } // always send the final position
+  });
+
+  // --- websocket ----------------------------------------------------------
+
+  function setStatus(state) {
+    $('status').textContent = state;
+    $('dot').className = 'dot ' + state;
+  }
+
+  function connect() {
+    setStatus('connecting');
+    ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/board');
+
+    ws.onopen = () => setStatus('open');
+
+    ws.onmessage = (event) => {
+      const m = JSON.parse(event.data);
+
+      if (m.type === 'welcome') {
+        me = m.you;
+        $('instance').textContent = m.instance;
+        $('instance').className = 'badge ' + m.instance;
+        document.title = m.instance + ' board — WS + Redis POC';
+        // The whole board, read out of the Redis HASH. This is the bit Pub/Sub
+        // alone can never give you: state that existed before you arrived.
+        shapes.clear();
+        for (const s of m.shapes) { shapes.set(s.id, s); renderShape(s); }
+        peers.clear();
+        for (const p of m.peers) peers.set(p.clientId, p);
+        renderPeers();
+        return;
+      }
+
+      if (m.type === 'shape') {
+        const mine = drag && drag.id === m.shape.id && m.shape.movedBy === me?.clientId;
+        if (mine) {
+          // Our own move echoing back mid-drag: take the new version number but
+          // keep our local position, or the shape stutters under the cursor.
+          shapes.get(m.shape.id).version = m.shape.version;
+          renderShape(shapes.get(m.shape.id));
+        } else {
+          shapes.set(m.shape.id, m.shape);
+          renderShape(m.shape);
+        }
+        return;
+      }
+
+      if (m.type === 'rejected') {
+        // We lost the race. The server hands back the authoritative shape and
+        // we snap to it - the visible cost of last-write-wins.
+        rejects++;
+        $('rejects').textContent = rejects;
+        shapes.set(m.shape.id, m.shape);
+        renderShape(m.shape);
+        const el = shapeEls.get(m.shape.id);
+        el.classList.add('rejected');
+        setTimeout(() => el.classList.remove('rejected'), 250);
+        return;
+      }
+
+      if (m.type === 'cursor') { renderCursor(m); return; }
+
+      if (m.type === 'peer-join') { peers.set(m.peer.clientId, m.peer); renderPeers(); return; }
+
+      if (m.type === 'peer-leave') {
+        peers.delete(m.clientId);
+        cursorEls.get(m.clientId)?.remove();
+        cursorEls.delete(m.clientId);
+        renderPeers();
+        return;
+      }
+
+      if (m.type === 'board-reset') {
+        shapes.clear();
+        for (const el of shapeEls.values()) el.remove();
+        shapeEls.clear();
+        for (const s of m.shapes) { shapes.set(s.id, s); renderShape(s); }
+        return;
+      }
+    };
+
+    ws.onclose = () => {
+      setStatus('closed');
+      setTimeout(connect, 1000); // killing a server becomes a demo, not a dead page
+    };
+    ws.onerror = () => setStatus('closed');
+  }
+
+  // --- demo helpers -------------------------------------------------------
+
+  $('reset').addEventListener('click', () => ws?.send(JSON.stringify({ type: 'reset' })));
+
+  // One person with one mouse can't drag the same box in two tabs at once, so
+  // this walks box 1 around a circle to fight against. Turn it on here, then
+  // grab box 1 by hand in the other tab and watch the rejection counter climb.
+  let autoTimer = null, angle = 0;
+  $('auto').addEventListener('change', (e) => {
+    clearInterval(autoTimer);
+    if (!e.target.checked) return;
+    autoTimer = setInterval(() => {
+      const s = shapes.get('box1');
+      if (!s) return;
+      angle += 0.12;
+      s.x = Math.round(300 + Math.cos(angle) * 180);
+      s.y = Math.round(200 + Math.sin(angle) * 120);
+      renderShape(s);
+      sendMove('box1');
+    }, 60);
+  });
+
+  connect();
+</script>
+</body>
+</html>

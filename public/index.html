@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>WebSocket + Redis POC</title>
+<style>
+  :root { --a: #2563eb; --b: #16a34a; --bg: #0f172a; --panel: #1e293b; --text: #e2e8f0; --muted: #94a3b8; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+         background: var(--bg); color: var(--text); display: flex; justify-content: center; }
+  .app { width: 100%; max-width: 720px; height: 100vh; display: flex; flex-direction: column; padding: 16px; gap: 12px; }
+  header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .badge { font-weight: 700; padding: 4px 12px; border-radius: 999px; color: #fff; background: #475569; }
+  .badge.server-A { background: var(--a); }
+  .badge.server-B { background: var(--b); }
+  .meta { color: var(--muted); font-size: 13px; }
+  a { color: #7dd3fc; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #64748b; margin-right: 6px; }
+  .dot.open { background: #22c55e; } .dot.closed { background: #ef4444; } .dot.connecting { background: #eab308; }
+  #log { flex: 1; overflow-y: auto; background: var(--panel); border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+  .msg { padding: 8px 10px; background: #0b1220; border-radius: 8px; border-left: 3px solid #475569; }
+  .msg.from-server-A { border-left-color: var(--a); }
+  .msg.from-server-B { border-left-color: var(--b); }
+  .msg .who { font-weight: 600; }
+  .msg .via { float: right; font-size: 11px; color: var(--muted); }
+  .sys { color: var(--muted); font-size: 13px; font-style: italic; text-align: center; }
+  form { display: flex; gap: 8px; }
+  input, button { font: inherit; padding: 10px 12px; border-radius: 8px; border: 1px solid #334155; background: var(--panel); color: var(--text); }
+  #user { width: 130px; }
+  #text { flex: 1; }
+  button { background: #334155; cursor: pointer; font-weight: 600; }
+  button:hover { background: #475569; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <span>Connected to</span>
+    <span class="badge" id="instance">…</span>
+    <span class="meta"><span class="dot connecting" id="dot"></span><span id="status">connecting</span></span>
+    <span class="meta" id="channel"></span>
+    <span class="meta">· <a href="/board">collaborative board</a></span>
+  </header>
+
+  <div id="log"></div>
+
+  <form id="form" autocomplete="off">
+    <input id="user" maxlength="24" />
+    <input id="text" placeholder="Type a message…" maxlength="500" />
+    <button type="submit">Send</button>
+  </form>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const log = $('log');
+
+  // A random-ish name so two tabs are distinguishable without typing.
+  $('user').value = 'user-' + Math.random().toString(36).slice(2, 6);
+
+  let ws;
+
+  function addSystem(text) {
+    const el = document.createElement('div');
+    el.className = 'sys';
+    el.textContent = text;
+    log.appendChild(el);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function addMessage(m) {
+    const el = document.createElement('div');
+    el.className = 'msg from-' + m.origin;
+    const time = m.ts ? new Date(m.ts).toLocaleTimeString() : '';
+    // "via <origin>" is the point of the whole demo: a message shown in the
+    // server-B tab but labelled server-A travelled A -> Redis -> B.
+    el.innerHTML =
+      '<span class="via">via ' + escapeHtml(m.origin) + ' · ' + time + '</span>' +
+      '<span class="who">' + escapeHtml(m.user) + '</span>: ' + escapeHtml(m.text);
+    log.appendChild(el);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  function setStatus(state) {
+    $('status').textContent = state;
+    $('dot').className = 'dot ' + state;
+  }
+
+  function connect() {
+    setStatus('connecting');
+    // Same host we loaded the page from, so :3001 and :3002 each hit their own
+    // server with zero configuration. ws:// is the WebSocket scheme (wss:// over TLS).
+    ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host);
+
+    ws.onopen = () => setStatus('open');
+
+    ws.onmessage = (event) => {
+      const m = JSON.parse(event.data);
+      if (m.type === 'hello') {
+        $('instance').textContent = m.instance;
+        $('instance').className = 'badge ' + m.instance;
+        $('channel').textContent = m.redis
+          ? 'redis channel: ' + m.channel
+          : 'REDIS DISABLED — local broadcast only';
+        document.title = m.instance + ' — WS + Redis POC';
+        addSystem('connected to ' + m.instance);
+        return;
+      }
+      if (m.type === 'chat') addMessage(m);
+    };
+
+    ws.onclose = () => {
+      setStatus('closed');
+      addSystem('disconnected — retrying in 1s');
+      setTimeout(connect, 1000); // so killing/restarting a server is a demo, not a dead page
+    };
+
+    ws.onerror = () => setStatus('closed');
+  }
+
+  $('form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const text = $('text').value.trim();
+    if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+    // Note: we do NOT render our own message here. It shows up only when it
+    // comes back from the server (via Redis) - which proves the round trip.
+    ws.send(JSON.stringify({ user: $('user').value, text }));
+    $('text').value = '';
+  });
+
+  connect();
+</script>
+</body>
+</html>

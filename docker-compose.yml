@@ -1,0 +1,12 @@
+# One Redis container. That's the whole infrastructure for this POC.
+#   docker compose up -d      start it
+#   docker compose down       stop and remove it
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: poc-redis
+    ports:
+      - "6379:6379"
+    # Pub/Sub is fire-and-forget - nothing is ever stored, so persistence
+    # would only add noise. No volumes either: this container is disposable.
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
